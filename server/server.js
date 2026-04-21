@@ -171,23 +171,26 @@ app.post('/api/nickname/login', async (req, res) => {
   if (!n || n.length < 2 || n.length > 20 || !/^[A-Za-z0-9_-]+$/.test(n))
     return res.json({ ok: false, error: 'Invalid (2-20 chars, A-Z 0-9 _ -)' });
   try {
-    const existing = await pool.query('SELECT id FROM players WHERE nickname ILIKE $1', [n]);
+    const existing = await pool.query('SELECT id, nickname FROM players WHERE nickname ILIKE $1', [n]);
     if (existing.rows.length > 0) {
-      // Already exists — log them in, return exact stored nickname
-      const exact = await pool.query('SELECT nickname FROM players WHERE id=$1', [existing.rows[0].id]);
-      return res.json({ ok: true, nickname: exact.rows[0].nickname, isNew: false });
+      // Already exists — log them in
+      return res.json({ ok: true, nickname: existing.rows[0].nickname, isNew: false });
     }
     // New player — register
-    await pool.query('INSERT INTO players (nickname) VALUES ($1)', [n]);
-    res.json({ ok: true, nickname: n, isNew: true });
-  } catch (e) {
-    // Race condition — someone registered same nick simultaneously
     try {
+      await pool.query('INSERT INTO players (nickname) VALUES ($1)', [n]);
+      return res.json({ ok: true, nickname: n, isNew: true });
+    } catch {
+      // Race: inserted by someone else between SELECT and INSERT
       const row = await pool.query('SELECT nickname FROM players WHERE nickname ILIKE $1', [n]);
       if (row.rows.length > 0)
         return res.json({ ok: true, nickname: row.rows[0].nickname, isNew: false });
-    } catch {}
-    res.json({ ok: false, error: 'Server error, try again' });
+      return res.json({ ok: false, error: 'Try again' });
+    }
+  } catch (e) {
+    console.error('login error:', e.message);
+    // DB unavailable — tell client to save locally
+    return res.json({ ok: false, error: 'DB unavailable', localFallback: true });
   }
 });
 
