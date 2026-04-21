@@ -1,60 +1,59 @@
 'use strict';
 
-const WebSocket  = require('ws');
+const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const Matchmaker = require('./matchmaking');
 const express    = require('express');
 const cors       = require('cors');
-const Database   = require('better-sqlite3');
+const { Pool }   = require('pg'); // Используем pg для Supabase
 const path       = require('path');
 const http       = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-// ── Database ──────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, 'lod.db'));
-db.pragma('journal_mode = WAL');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS players (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    nickname        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    total_matches   INTEGER NOT NULL DEFAULT 0,
-    hero_wins       INTEGER NOT NULL DEFAULT 0,
-    dungeon_wins    INTEGER NOT NULL DEFAULT 0,
-    tiles_walked    INTEGER NOT NULL DEFAULT 0,
-    monsters_killed INTEGER NOT NULL DEFAULT 0,
-    goblin_killed   INTEGER NOT NULL DEFAULT 0,
-    troll_killed    INTEGER NOT NULL DEFAULT 0,
-    keys_collected  INTEGER NOT NULL DEFAULT 0,
-    items_used      INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS achievements (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id  INTEGER NOT NULL REFERENCES players(id),
-    achiev_id  TEXT    NOT NULL,
-    tier       INTEGER NOT NULL DEFAULT 0,
-    claimed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    UNIQUE(player_id, achiev_id)
-  );
-`);
+// ── Database (Supabase / PostgreSQL) ──────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
-const stmts = {
-  findNick:    db.prepare('SELECT id FROM players WHERE nickname = ? COLLATE NOCASE'),
-  createNick:  db.prepare('INSERT INTO players (nickname) VALUES (?)'),
-  getPlayer:   db.prepare('SELECT * FROM players WHERE nickname = ? COLLATE NOCASE'),
-  updateStats: db.prepare(`UPDATE players SET
-    total_matches=total_matches+@tm, hero_wins=hero_wins+@hw, dungeon_wins=dungeon_wins+@dw,
-    tiles_walked=tiles_walked+@tw, monsters_killed=monsters_killed+@mk,
-    goblin_killed=goblin_killed+@gk, troll_killed=troll_killed+@trk,
-    keys_collected=keys_collected+@kc, items_used=items_used+@iu
-    WHERE nickname=@nick COLLATE NOCASE`),
-  getAchievs:  db.prepare('SELECT achiev_id, tier FROM achievements WHERE player_id=?'),
-  upsertAch:   db.prepare(`INSERT INTO achievements(player_id,achiev_id,tier)VALUES(@pid,@aid,@tier)
-    ON CONFLICT(player_id,achiev_id) DO UPDATE SET tier=@tier,claimed_at=strftime('%s','now')`)
+// Инициализация таблиц (PostgreSQL синтаксис)
+const initDb = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS players (
+        id SERIAL PRIMARY KEY,
+        nickname TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        total_matches INTEGER NOT NULL DEFAULT 0,
+        hero_wins INTEGER NOT NULL DEFAULT 0,
+        dungeon_wins INTEGER NOT NULL DEFAULT 0,
+        tiles_walked INTEGER NOT NULL DEFAULT 0,
+        monsters_killed INTEGER NOT NULL DEFAULT 0,
+        goblin_killed INTEGER NOT NULL DEFAULT 0,
+        troll_killed INTEGER NOT NULL DEFAULT 0,
+        keys_collected INTEGER NOT NULL DEFAULT 0,
+        items_used INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS achievements (
+        id SERIAL PRIMARY KEY,
+        player_id INTEGER NOT NULL REFERENCES players(id),
+        achiev_id TEXT NOT NULL,
+        tier INTEGER NOT NULL DEFAULT 0,
+        claimed_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(player_id, achiev_id)
+      );
+    `);
+    console.log("✅ База данных Supabase готова к работе");
+  } catch (err) {
+    console.error("❌ Ошибка инициализации базы:", err);
+  }
 };
+initDb();
 
-// Mirrors engine.js
+// ── Достижения и логика (как в engine.js) ─────────────────────
 const ACH_TIERS = {
   tiles_walked:    [100,500,2000,10000,50000],
   monsters_killed: [5,20,60,200,500],
@@ -85,7 +84,7 @@ const STAT_ACH = {
 function computeNewAchievs(player, prev) {
   const out = [];
   for (const [col, aid] of Object.entries(STAT_ACH)) {
-    const val   = player[col] || 0;
+    const val   = parseInt(player[col]) || 0;
     const tiers = ACH_TIERS[aid];
     const coins = ACH_COINS[aid];
     const p     = prev[aid] ?? -1;
@@ -99,32 +98,66 @@ function computeNewAchievs(player, prev) {
   return out;
 }
 
-function applyStats(nick, payload, won, role) {
-  const p = stmts.getPlayer.get(nick);
-  if (!p) return null;
-  const prevRows = stmts.getAchievs.all(p.id);
-  const prev = {}; prevRows.forEach(r => { prev[r.achiev_id] = r.tier; });
-  stmts.updateStats.run({
-    nick, tm:1,
-    hw: role==='hero'    && won ? 1 : 0,
-    dw: role==='dungeon' && won ? 1 : 0,
-    tw:  payload.tilesWalked    || 0,
-    mk:  payload.monstersKilled || 0,
-    gk:  payload.goblinKilled   || 0,
-    trk: payload.trollKilled    || 0,
-    kc:  payload.keysCollected  || 0,
-    iu:  payload.itemsUsed      || 0
-  });
-  const updated = stmts.getPlayer.get(nick);
-  const newA = computeNewAchievs(updated, prev);
-  let coins = 0;
-  db.transaction(list => {
-    for (const a of list) {
-      stmts.upsertAch.run({ pid: p.id, aid: a.achievId, tier: a.tier });
+async function applyStats(nick, payload, won, role) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // Получаем игрока (в Postgres ILIKE для регистронезависимости)
+    const playerRes = await client.query('SELECT * FROM players WHERE nickname ILIKE $1', [nick]);
+    const p = playerRes.rows[0];
+    if (!p) throw new Error('Player not found');
+
+    // Получаем текущие достижения
+    const prevRows = await client.query('SELECT achiev_id, tier FROM achievements WHERE player_id = $1', [p.id]);
+    const prev = {}; 
+    prevRows.rows.forEach(r => { prev[r.achiev_id] = r.tier; });
+
+    // Обновляем статистику
+    await client.query(`UPDATE players SET
+      total_matches = total_matches + 1,
+      hero_wins = hero_wins + $1,
+      dungeon_wins = dungeon_wins + $2,
+      tiles_walked = tiles_walked + $3,
+      monsters_killed = monsters_killed + $4,
+      goblin_killed = goblin_killed + $5,
+      troll_killed = troll_killed + $6,
+      keys_collected = keys_collected + $7,
+      items_used = items_used + $8
+      WHERE id = $9`, [
+        role==='hero' && won ? 1 : 0,
+        role==='dungeon' && won ? 1 : 0,
+        payload.tilesWalked || 0,
+        payload.monstersKilled || 0,
+        payload.goblinKilled || 0,
+        payload.trollKilled || 0,
+        payload.keysCollected || 0,
+        payload.itemsUsed || 0,
+        p.id
+      ]);
+
+    const updatedRes = await client.query('SELECT * FROM players WHERE id = $1', [p.id]);
+    const updated = updatedRes.rows[0];
+    const newA = computeNewAchievs(updated, prev);
+
+    let coins = 0;
+    for (const a of newA) {
+      await client.query(`
+        INSERT INTO achievements(player_id, achiev_id, tier) VALUES($1, $2, $3)
+        ON CONFLICT(player_id, achiev_id) DO UPDATE SET tier = $3, claimed_at = NOW()
+      `, [p.id, a.achievId, a.tier]);
       coins += a.coins;
     }
-  })(newA);
-  return { newAchievements: newA, coinsEarned: coins };
+
+    await client.query('COMMIT');
+    return { newAchievements: newA, coinsEarned: coins };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    return null;
+  } finally {
+    client.release();
+  }
 }
 
 // ── REST API ──────────────────────────────────────────────────
@@ -132,28 +165,33 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get('/api/nickname/check/:nick', (req, res) => {
+app.get('/api/nickname/check/:nick', async (req, res) => {
   const n = (req.params.nick||'').trim();
   if (!n || n.length < 2 || n.length > 20 || !/^[A-Za-z0-9_-]+$/.test(n))
     return res.json({ ok: false, error: 'Invalid (2-20 chars, A-Z 0-9 _ -)' });
-  res.json(stmts.findNick.get(n) ? { ok: false, error: 'Already taken' } : { ok: true });
+  
+  const check = await pool.query('SELECT id FROM players WHERE nickname ILIKE $1', [n]);
+  res.json(check.rows.length > 0 ? { ok: false, error: 'Already taken' } : { ok: true });
 });
 
-app.post('/api/nickname/register', (req, res) => {
+app.post('/api/nickname/register', async (req, res) => {
   const n = (req.body.nickname||'').trim();
   if (!n || n.length < 2 || n.length > 20 || !/^[A-Za-z0-9_-]+$/.test(n))
     return res.json({ ok: false, error: 'Invalid nickname' });
   try {
-    stmts.createNick.run(n);
+    await pool.query('INSERT INTO players (nickname) VALUES ($1)', [n]);
     res.json({ ok: true, nickname: n });
   } catch { res.json({ ok: false, error: 'Already taken' }); }
 });
 
-app.get('/api/player/:nick', (req, res) => {
-  const p = stmts.getPlayer.get(req.params.nick);
+app.get('/api/player/:nick', async (req, res) => {
+  const pRes = await pool.query('SELECT * FROM players WHERE nickname ILIKE $1', [req.params.nick]);
+  const p = pRes.rows[0];
   if (!p) return res.json({ ok: false, error: 'Not found' });
-  const achievRows = stmts.getAchievs.all(p.id);
-  const achievs = {}; achievRows.forEach(r => { achievs[r.achiev_id] = r.tier; });
+  
+  const achRes = await pool.query('SELECT achiev_id, tier FROM achievements WHERE player_id = $1', [p.id]);
+  const achievs = {}; 
+  achRes.rows.forEach(r => { achievs[r.achiev_id] = r.tier; });
   res.json({ ok: true, player: p, achievements: achievs });
 });
 
@@ -165,7 +203,7 @@ const matches    = new Map();
 const players    = new Map();
 
 function send(ws, type, payload) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, payload }));
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, payload }));
 }
 function broadcast(mid, type, payload, excl) {
   const m = matches.get(mid); if (!m) return;
@@ -178,7 +216,7 @@ wss.on('connection', ws => {
   players.set(pid, { ws, matchId: null, role: null });
   send(ws, 'connected', { playerId: pid });
 
-  ws.on('message', raw => {
+  ws.on('message', async raw => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     const { type, payload } = msg;
     const player = players.get(pid); if (!player) return;
@@ -209,7 +247,10 @@ wss.on('connection', ws => {
         const m = matches.get(player.matchId); if (!m) break;
         if (!m._ready) m._ready = new Set();
         m._ready.add(player.role);
-        if (m._ready.size === 2) { m.state='active'; broadcast(player.matchId,'game_start',{timestamp:Date.now()}); }
+        if (m._ready.size === 2) { 
+          m.state='active'; 
+          broadcast(player.matchId,'game_start',{timestamp:Date.now()}); 
+        }
         break;
       }
       case 'hero_update':    if (player.role==='hero')    broadcast(player.matchId,'hero_update',payload,'hero'); break;
@@ -231,7 +272,7 @@ wss.on('connection', ws => {
         const nick = payload?.nickname; if (!nick) break;
         const m    = matches.get(player.matchId);
         const won  = m?.state === 'finished';
-        const result = applyStats(nick, payload, won, 'hero');
+        const result = await applyStats(nick, payload, won, 'hero');
         if (result && result.newAchievements.length > 0) {
           send(ws, 'achievements_unlocked', result);
         }
@@ -247,12 +288,14 @@ wss.on('connection', ws => {
       matchmaker.removeFromQueue(pid);
       if (p.matchId) {
         const m = matches.get(p.matchId);
-        if (m && m.state==='active') { broadcast(p.matchId,'opponent_disconnected',{}); matches.delete(p.matchId); }
+        if (m && m.state==='active') { 
+          broadcast(p.matchId,'opponent_disconnected',{}); 
+          matches.delete(p.matchId); 
+        }
       }
     }
     players.delete(pid);
   });
-  ws.on('error', () => players.delete(pid));
 });
 
 server.listen(PORT, () => console.log('Legend of Dungeon server on port ' + PORT));
