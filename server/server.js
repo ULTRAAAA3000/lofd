@@ -11,8 +11,12 @@ const http       = require('http');
 const PORT = process.env.PORT || 8080;
 
 // ── Database (Supabase / PostgreSQL) ──────────────────────────
+const dbUrl = process.env.DATABASE_URL || '';
+console.log('DATABASE_URL present:', !!dbUrl);
+console.log('DATABASE_URL preview:', dbUrl ? dbUrl.replace(/:([^:@]+)@/, ':***@').substring(0, 80) : 'NOT SET');
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: dbUrl || undefined,
   ssl: { rejectUnauthorized: false }
 });
 
@@ -374,8 +378,8 @@ wss.on('connection', ws => {
       case 'match_stats': {
         if (player.role !== 'hero') break;
         const nick = payload?.nickname; if (!nick) break;
-        const m    = matches.get(player.matchId);
-        const won  = m?.state === 'finished';
+        // won is passed explicitly in payload now
+        const won  = !!payload.won;
         const result = await applyStats(nick, payload, won, 'hero');
         if (result && result.newAchievements.length > 0) {
           send(ws, 'achievements_unlocked', result);
